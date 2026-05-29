@@ -21,11 +21,8 @@ TIER_LABEL = "Emerald+"
 
 QUEUE = "ranked"
 
-# 每个位置最多取多少个英雄
-TOP_N_PER_LANE = 40
-
 # 过滤登场率太低的数据，避免冷门样本太少
-MIN_PICK_RATE = 0.3
+MIN_PICK_RATE = 0
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -107,13 +104,213 @@ async def safe_goto(page: Page, url: str) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
     # 页面有时会继续异步渲染，稍微等一下
-    await page.wait_for_timeout(2500)
+    await page.wait_for_timeout(3000)
 
     # 再等到网络空闲。失败也不致命。
     try:
         await page.wait_for_load_state("networkidle", timeout=20_000)
     except Exception:
         pass
+
+
+async def scroll_to_bottom(page: Page) -> None:
+    """
+    OP.GG 榜单可能是滚动加载/懒加载。
+    不滚动的话，Playwright 可能只抓到当前视口附近的部分英雄。
+    """
+    previous_height = 0
+    stable_count = 0
+
+    for _ in range(30):
+        current_height = await page.evaluate("document.body.scrollHeight")
+
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1000)
+
+        new_height = await page.evaluate("document.body.scrollHeight")
+
+        if new_height == previous_height or new_height == current_height:
+            stable_count += 1
+        else:
+            stable_count = 0
+
+        previous_height = new_height
+
+        if stable_count >= 3:
+            break
+
+    # 回到顶部不是必须，但方便后续 debug
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(500)
+
+
+async def extract_raw_items_from_current_dom(page: Page) -> List[Dict]:
+    """
+    只解析 OP.GG 右侧 Ranking Table。
+
+    修复点：
+    - rank 不再从 cells[0].innerText 取；
+    - 改成 cells[0].querySelector("span.w-5")；
+    - 避免把排名和涨跌数字拼成 11 / 23 / 59。
+    """
+    return await page.evaluate(
+        """
+        () => {
+            function textOf(el) {
+                return (el && el.innerText ? el.innerText.trim() : "");
+            }
+
+            function findRankingTable() {
+                const tables = Array.from(document.querySelectorAll("table"));
+
+                for (const table of tables) {
+                    const caption = table.querySelector("caption");
+                    const captionText = textOf(caption);
+
+                    if (captionText === "Ranking Table") {
+                        return table;
+                    }
+                }
+
+                for (const table of tables) {
+                    const tableText = textOf(table);
+
+                    if (
+                        tableText.includes("排名") &&
+                        tableText.includes("英雄") &&
+                        tableText.includes("胜率") &&
+                        tableText.includes("登场率") &&
+                        tableText.includes("禁用率")
+                    ) {
+                        return table;
+                    }
+                }
+
+                return null;
+            }
+
+            function parseRankFromCell(cell) {
+                /*
+                 * OP.GG 第一列里有两个数字：
+                 * - 第一个 span.w-5 是真正排名
+                 * - 后面的 green/red span 是上升/下降位数
+                 *
+                 * 所以必须优先取 span.w-5。
+                 */
+                const rankSpan = cell.querySelector("span.w-5");
+
+                if (rankSpan) {
+                    const rankText = textOf(rankSpan);
+                    const n = Number(rankText);
+
+                    if (Number.isInteger(n) && n >= 1 && n <= 300) {
+                        return n;
+                    }
+                }
+
+                /*
+                 * fallback：取第一个 span 的纯数字。
+                 */
+                const spans = Array.from(cell.querySelectorAll("span"));
+
+                for (const span of spans) {
+                    const t = textOf(span);
+
+                    if (/^\\d{1,3}$/.test(t)) {
+                        const n = Number(t);
+
+                        if (n >= 1 && n <= 300) {
+                            return n;
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            const table = findRankingTable();
+
+            if (!table) {
+                return [];
+            }
+
+            const rows = Array.from(table.querySelectorAll("tbody tr"));
+            const items = [];
+
+            for (const row of rows) {
+                if (row.classList.contains("ad")) continue;
+
+                const cells = Array.from(row.querySelectorAll("td"));
+
+                if (cells.length < 7) continue;
+
+                const rankNo = parseRankFromCell(cells[0]);
+
+                if (!rankNo) continue;
+
+                const championStrong = cells[1].querySelector("strong");
+                const championName = textOf(championStrong);
+
+                if (!championName) continue;
+
+                const championLink = cells[1].querySelector("a[href*='/lol/champions/']");
+                const href = championLink ? championLink.href : "";
+
+                const rowText = textOf(row);
+                const percentages = rowText.match(/\\d+(?:\\.\\d+)?%/g) || [];
+
+                if (percentages.length < 3) continue;
+
+                items.push({
+                    championName,
+                    href,
+                    rowText,
+                    rankNo,
+                    percentages: percentages.slice(0, 3)
+                });
+            }
+
+            return items;
+        }
+        """
+    )
+
+
+async def collect_raw_items_by_scrolling(page: Page) -> List[Dict]:
+    """
+    viewport 已经设置成 1920x6000 后，OP.GG 榜单通常会一次性渲染完整。
+    这里只做少量滚动和多次采集，避免复杂滚动导致漏数据。
+    """
+    collected = {}
+
+    async def collect_once():
+        current_items = await extract_raw_items_from_current_dom(page)
+
+        for item in current_items:
+            rank_no = item.get("rankNo")
+            champion_name = item.get("championName", "").strip()
+
+            if rank_no is None or not champion_name:
+                continue
+
+            collected[rank_no] = item
+
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(1500)
+    await collect_once()
+
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(2000)
+    await collect_once()
+
+    await page.keyboard.press("End")
+    await page.wait_for_timeout(1500)
+    await collect_once()
+
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(500)
+
+    return [collected[k] for k in sorted(collected.keys())]
 
 
 async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
@@ -125,61 +322,28 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
     page_text = await page.locator("body").inner_text(timeout=30_000)
     patch_version = extract_patch_version(page_text)
 
-    # 抓所有指向 champion detail 的 a 标签。
-    # OP.GG 表格可能不是标准 table，所以不要只依赖 tr。
-    raw_items = await page.locator("a[href*='/lol/champions/']").evaluate_all(
-        """
-        anchors => {
-            const items = [];
+    raw_items = await collect_raw_items_by_scrolling(page)
 
-            for (const a of anchors) {
-                const href = a.href || "";
-                const name = (a.innerText || "").trim();
-
-                if (!href.includes("/lol/champions/")) continue;
-                if (!name) continue;
-
-                let node = a;
-                let container = null;
-
-                // 往上找一个看起来像“榜单行”的父节点
-                for (let i = 0; i < 8 && node; i++) {
-                    const text = (node.innerText || "").trim();
-                    const percentCount = (text.match(/\\d+(?:\\.\\d+)?%/g) || []).length;
-
-                    if (percentCount >= 3) {
-                        container = node;
-                        break;
-                    }
-
-                    node = node.parentElement;
-                }
-
-                if (!container) continue;
-
-                items.push({
-                    championName: name,
-                    href,
-                    rowText: (container.innerText || "").trim()
-                });
-            }
-
-            return items;
-        }
-        """
-    )
+    print(f"[DEBUG] {lane.upper()} raw_items count = {len(raw_items)}")
 
     stats: List[ChampionLaneStat] = []
-    seen = set()
+    seen_ranks = set()
 
     for item in raw_items:
-        champion_name = item["championName"].strip()
-        row_text = item["rowText"].strip()
+        champion_name = item.get("championName", "").strip()
+        row_text = item.get("rowText", "").strip()
+        rank_no = item.get("rankNo")
 
-        if champion_name in seen:
+        if not champion_name:
             continue
 
-        percentages = re.findall(r"\d+(?:\.\d+)?%", row_text)
+        if rank_no is None:
+            continue
+
+        if rank_no in seen_ranks:
+            continue
+
+        percentages = item.get("percentages") or re.findall(r"\d+(?:\.\d+)?%", row_text)
 
         if len(percentages) < 3:
             continue
@@ -191,14 +355,14 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
         if pick_rate is not None and pick_rate < MIN_PICK_RATE:
             continue
 
-        seen.add(champion_name)
+        seen_ranks.add(rank_no)
 
         stats.append(
             ChampionLaneStat(
                 champion_name=champion_name,
                 lane=lane.upper(),
                 lane_cn=LANES[lane],
-                rank_no=len(stats) + 1,
+                rank_no=rank_no,
                 win_rate=win_rate,
                 pick_rate=pick_rate,
                 ban_rate=ban_rate,
@@ -211,10 +375,19 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
             )
         )
 
-        if len(stats) >= TOP_N_PER_LANE:
-            break
+    stats.sort(key=lambda x: x.rank_no)
 
     print(f"[OK] {lane.upper()} scraped {len(stats)} champions, patch={patch_version}")
+
+    debug_ranks = sorted(set(x.rank_no for x in stats))
+    print(f"[DEBUG] {lane.upper()} parsed ranks = {debug_ranks}")
+
+    if debug_ranks:
+        expected_max = max(debug_ranks)
+        missing = [i for i in range(1, expected_max + 1) if i not in debug_ranks]
+        print(f"[DEBUG] {lane.upper()} missing ranks = {missing}")
+        print(f"[DEBUG] {lane.upper()} first 10 champions = {[x.champion_name for x in stats[:10]]}")
+
     return stats
 
 
@@ -288,7 +461,7 @@ async def main():
 
         page = await browser.new_page(
             locale="zh-CN",
-            viewport={"width": 1440, "height": 1200},
+            viewport={"width": 1920, "height": 6000},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
