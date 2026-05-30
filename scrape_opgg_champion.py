@@ -2,6 +2,9 @@ import asyncio
 import json
 import random
 import re
+import os
+import psycopg2
+from dotenv import load_dotenv
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +12,6 @@ from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright, Page
-
 
 BASE_URL = "https://op.gg/zh-cn/lol/champions"
 
@@ -21,12 +23,16 @@ TIER_LABEL = "Emerald+"
 
 QUEUE = "ranked"
 
-# 过滤登场率太低的数据，避免冷门样本太少
-MIN_PICK_RATE = 0
+# 过滤tier太低的数据，避免冷门样本太少
+EXCLUDE_OPGG_TIER_5 = True
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+AUTO_IMPORT_TO_DB = True
 
 LANES = {
     "top": "上路",
@@ -36,6 +42,24 @@ LANES = {
     "support": "辅助",
 }
 
+LANE_DB_MAP = {
+    "上路": "TOP",
+    "打野": "JUNGLE",
+    "中路": "MID",
+    "下路": "ADC",
+    "辅助": "SUPPORT",
+}
+
+
+def normalize_lane_for_db(lane_cn: Optional[str]) -> Optional[str]:
+    if lane_cn is None:
+        return None
+
+    if lane_cn not in LANE_DB_MAP:
+        raise ValueError(f"Unknown lane: {lane_cn}")
+
+    return LANE_DB_MAP[lane_cn]
+
 
 @dataclass
 class ChampionLaneStat:
@@ -43,6 +67,7 @@ class ChampionLaneStat:
     lane: str
     lane_cn: str
     rank_no: int
+    opgg_tier: Optional[int]
     win_rate: Optional[float]
     pick_rate: Optional[float]
     ban_rate: Optional[float]
@@ -256,16 +281,21 @@ async def extract_raw_items_from_current_dom(page: Page) -> List[Dict]:
                 const championLink = cells[1].querySelector("a[href*='/lol/champions/']");
                 const href = championLink ? championLink.href : "";
 
+                const tierText = textOf(cells[2]);
+                const tierMatch = tierText.match(/[1-5]/);
+                const opggTier = tierMatch ? Number(tierMatch[0]) : null;
+                
                 const rowText = textOf(row);
-                const percentages = rowText.match(/\\d+(?:\\.\\d+)?%/g) || [];
-
+                const percentages = rowText.match(/\d+(?:\.\d+)?%/g) || [];
+                
                 if (percentages.length < 3) continue;
-
+                
                 items.push({
                     championName,
                     href,
                     rowText,
                     rankNo,
+                    opggTier,
                     percentages: percentages.slice(0, 3)
                 });
             }
@@ -333,6 +363,7 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
         champion_name = item.get("championName", "").strip()
         row_text = item.get("rowText", "").strip()
         rank_no = item.get("rankNo")
+        opgg_tier = item.get("opggTier")
 
         if not champion_name:
             continue
@@ -341,6 +372,9 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
             continue
 
         if rank_no in seen_ranks:
+            continue
+
+        if EXCLUDE_OPGG_TIER_5 and opgg_tier == 5:
             continue
 
         percentages = item.get("percentages") or re.findall(r"\d+(?:\.\d+)?%", row_text)
@@ -352,9 +386,6 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
         pick_rate = parse_percent(percentages[1])
         ban_rate = parse_percent(percentages[2])
 
-        if pick_rate is not None and pick_rate < MIN_PICK_RATE:
-            continue
-
         seen_ranks.add(rank_no)
 
         stats.append(
@@ -363,6 +394,7 @@ async def scrape_lane(page: Page, lane: str) -> List[ChampionLaneStat]:
                 lane=lane.upper(),
                 lane_cn=LANES[lane],
                 rank_no=rank_no,
+                opgg_tier=opgg_tier,
                 win_rate=win_rate,
                 pick_rate=pick_rate,
                 ban_rate=ban_rate,
@@ -447,6 +479,132 @@ def build_champion_mapping(raw_stats: List[ChampionLaneStat]) -> List[Dict]:
     return champion_mapping
 
 
+def save_champion_mapping_to_db(mapping_output: Dict) -> None:
+    """
+    把 championMapping 自动写入 PostgreSQL。
+
+    注意：
+    1. 会 upsert champion 表。
+    2. 会 upsert champion_lane_mapping 表。
+    3. 不会覆盖 champion.damage_type / is_enabled / manual_note。
+    """
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL in .env")
+
+    source = mapping_output.get("source", "OP.GG")
+    region = mapping_output.get("region", "Korea")
+    tier = mapping_output.get("tier", "Emerald+")
+    queue = mapping_output.get("queue", "ranked")
+    scraped_at_text = mapping_output.get("scrapedAt")
+    champion_mapping = mapping_output.get("championMapping", [])
+
+    scraped_at = None
+    if scraped_at_text:
+        scraped_at = datetime.fromisoformat(scraped_at_text.replace("Z", "+00:00"))
+
+    print()
+    print("[DB] Start importing champion mapping...")
+    print(f"[DB] source={source}, region={region}, tier={tier}, queue={queue}")
+    print(f"[DB] champion count={len(champion_mapping)}")
+
+    conn = psycopg2.connect(DATABASE_URL)
+
+    inserted_or_updated_champions = 0
+    inserted_or_updated_mappings = 0
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # 每次导入前，先删除旧的英雄池 mapping
+                # 注意：只删 champion_lane_mapping，不删 champion 表，避免 damage_type 丢失
+                cur.execute(
+                    """
+                    DELETE FROM champion_lane_mapping
+                    WHERE source = %s
+                      AND region = %s
+                      AND tier = %s
+                      AND queue_type = %s;
+                    """,
+                    (
+                        source,
+                        region,
+                        tier,
+                        queue,
+                    ),
+                )
+
+                print(f"[DB] old mappings deleted: {cur.rowcount}")
+                for item in champion_mapping:
+                    champion_name = item["championName"]
+                    primary_lane = normalize_lane_for_db(item["primaryLane"])
+                    secondary_lane = normalize_lane_for_db(item.get("secondaryLane"))
+
+                    # upsert champion
+                    # 不覆盖 damage_type / is_enabled / manual_note
+                    cur.execute(
+                        """
+                        INSERT INTO champion (
+                            champion_name_cn,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            %s,
+                            CURRENT_TIMESTAMP,
+                            CURRENT_TIMESTAMP
+                        )
+                        ON CONFLICT (champion_name_cn)
+                        DO UPDATE SET
+                            updated_at = CURRENT_TIMESTAMP
+                        RETURNING id;
+                        """,
+                        (champion_name,),
+                    )
+
+                    champion_id = cur.fetchone()[0]
+                    inserted_or_updated_champions += 1
+
+                    # upsert champion_lane_mapping
+                    cur.execute(
+                        """
+                        INSERT INTO champion_lane_mapping (
+                            champion_id,
+                            primary_lane,
+                            secondary_lane,
+                            source,
+                            region,
+                            tier,
+                            queue_type,
+                            scraped_at,
+                            updated_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            CURRENT_TIMESTAMP
+                        );
+                        """,
+                        (
+                            champion_id,
+                            primary_lane,
+                            secondary_lane,
+                            source,
+                            region,
+                            tier,
+                            queue,
+                            scraped_at,
+                        ),
+                    )
+
+                    inserted_or_updated_mappings += 1
+
+        print(f"[DB] champions upserted: {inserted_or_updated_champions}")
+        print(f"[DB] mappings upserted: {inserted_or_updated_mappings}")
+        print("[DB] Import completed.")
+
+    finally:
+        conn.close()
+
+
 async def main():
     all_stats: List[ChampionLaneStat] = []
 
@@ -518,6 +676,9 @@ async def main():
     print(f"[DONE] champion mapping saved to: {mapping_path}")
     print(f"[DONE] total raw rows: {len(all_stats)}")
     print(f"[DONE] total unique champions: {len(champion_mapping)}")
+
+    if AUTO_IMPORT_TO_DB:
+        save_champion_mapping_to_db(mapping_output)
 
 
 if __name__ == "__main__":
